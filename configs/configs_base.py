@@ -72,6 +72,7 @@ basic_configs = {
     "use_template": "None",
     "use_cluster": 'na',
     "num_templates": 4,
+    "dataset_type": "rna_only",  # "rna_only" or "multichain"
 }
 data_configs = {
     # Data

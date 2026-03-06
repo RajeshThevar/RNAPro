@@ -216,12 +216,26 @@ class RNAPro(nn.Module):
         # RibonanzaNet2
         if self.configs.model.use_RibonanzaNet2:
             src = input_feature_dict['tokenized_seq'].unsqueeze(dim=0)
+            # Ensure RibonanzaNet2 is on the correct device (may have been
+            # CPU-offloaded from previous inference call)
+            rnet_device = src.device
+            if next(self.ribonanza_net.parameters()).device != rnet_device:
+                self.ribonanza_net.to(rnet_device)
             with torch.no_grad():
-                all_sequence_features, all_pairwise_features =self.ribonanza_net.get_embeddings(src, torch.ones_like(src).long().to(src.device))
-            sequence_features=all_sequence_features*self.layer_weights.softmax(0)[:,None,None,None]
-            sequence_features=sequence_features.sum(0)
-            sequence_features = self.projection_sequence_features(sequence_features).squeeze(dim=0)
-            s_inputs = self.gated_sequence_feature_injector(s_inputs, sequence_features)
+                sequence_features, pairwise_features_rnet = (
+                    self.ribonanza_net.get_embeddings(
+                        src,
+                        torch.ones_like(src).long().to(src.device),
+                        layer_weights=self.layer_weights,
+                    )
+                )
+            # sequence_features is already weighted sum [B, L, D]
+            sequence_features = self.projection_sequence_features(
+                sequence_features
+            ).squeeze(dim=0)
+            s_inputs = self.gated_sequence_feature_injector(
+                s_inputs, sequence_features
+            )
 
         if "constraint_feature" in input_feature_dict:
             z_constraint = self.constraint_embedder(
@@ -261,10 +275,18 @@ class RNAPro(nn.Module):
                 z_init = z_init + z_constraint
                 
         if self.configs.model.use_RibonanzaNet2:
-            pairwise_features=all_pairwise_features*self.layer_weights.softmax(0)[:,None,None,None,None]
-            pairwise_features=pairwise_features.sum(0)
-            pairwise_features = self.projection_pairwise_features(pairwise_features).squeeze(dim=0)
-            z_init = self.gated_pairwise_feature_injector(z_init, pairwise_features)
+            # pairwise_features_rnet is already weighted sum [B, L, L, D]
+            pairwise_features_proj = self.projection_pairwise_features(
+                pairwise_features_rnet
+            ).squeeze(dim=0)
+            z_init = self.gated_pairwise_feature_injector(
+                z_init, pairwise_features_proj
+            )
+            del pairwise_features_rnet, sequence_features, pairwise_features_proj
+            # CPU offload RibonanzaNet2 during inference (frees ~800MB VRAM)
+            if not self.training:
+                self.ribonanza_net.cpu()
+                torch.cuda.empty_cache()
 
         # Line 6
         z = torch.zeros_like(z_init)

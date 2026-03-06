@@ -850,19 +850,17 @@ class RNADataset(Dataset):
             Dict with template_coords, template_coords_mask, n_templates.
             Uses first MAX_TEMPLATE_FEATURES (4) templates, shuffled during training.
         """
-        if sample_name in self.template_features_names: # template exists
+        n_slots = 5  # Number of template slots in template_features.pt
+        if sample_name in self.template_features_names:  # template exists
             if np.random.rand() < 0.5:
-                random_idx = np.random.randint(0, 40, 4)
-                template_ca = torch.from_numpy(self.template_features[sample_name]['xyz'][:, random_idx]).permute(1,0,2).float()
+                random_idx = np.random.choice(n_slots, size=4, replace=True)
+                template_ca = torch.from_numpy(self.template_features[sample_name]['xyz'][:, random_idx]).permute(1, 0, 2).float()
                 template_ca = template_ca[:, crop_start:crop_end]
             else:
                 template_ca = torch.zeros(4, len(sequence), 3)
         else:
             template_ca = torch.zeros(4, len(sequence), 3)
-        
-        print(template_ca.shape)
-        mask = torch.ones(4, len(sequence))
-        print(mask.shape)
+
         template_features = {
             "template_coords": template_ca,  # Shape: (n_templates, n_residues, 3)
             "template_coords_mask": torch.ones(4, len(sequence)),  # Shape: (n_templates, n_residues)

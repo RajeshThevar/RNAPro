@@ -200,11 +200,19 @@ class Transition(nn.Module):
             in_features=n * c_in, out_features=c_in, initializer="zeros"
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        inplace_safe: bool = False,
+    ) -> torch.Tensor:
         """
         Args:
             x (torch.Tensor): the input tensor
                 [..., c]
+            inplace_safe (bool): if True, write output directly into x
+                via in-place addition (fuses residual connection). The
+                caller must use the pattern ``x = self.transition(x, inplace_safe=True)``
+                instead of ``x += self.transition(x)``.
 
         Returns:
             torch.Tensor: the output tensor as the same shape of x
@@ -219,28 +227,52 @@ class Transition(nn.Module):
         else:
             other_dims = x.shape[:-1]
             dim_size = x.shape[-1]
-            size = x.shape[-2]
-            x = x.reshape(-1, dim_size)
-            chunk_num = 1 if size < 3200 else 8
-            chunks = torch.chunk(x, chunk_num, dim=-2)
-            outputs = torch.empty(
-                (x.shape[0], self.c_in), dtype=x.dtype, device=x.device
-            )
-            start = 0
-            for chunk in chunks:
-                y = self.layernorm1(chunk)
-                a = self.linear_no_bias_a(y)
-                a = F.silu(a, True)
-                b = self.linear_no_bias_b(y)
-                del y
-                b *= a
-                del a
-                b = self.linear_no_bias(b)
-                outputs[start : start + b.shape[0]] = b
-                start += b.shape[0]
-                del b
-            outputs = outputs.reshape(*other_dims, self.c_in)
-            return outputs
+            x_flat = x.reshape(-1, dim_size)
+            total = x_flat.shape[0]
+
+            # Adaptive chunking: target ~64K positions per chunk to keep
+            # the 4x-expanded intermediate under ~128 MB (FP16) / ~256 MB (FP32).
+            # Previous threshold (size < 3200 -> no chunking) left L<=700
+            # completely unchunked, wasting ~576 MB at L=500.
+            target_chunk = 65536  # 256^2 positions
+            chunk_num = max(1, (total + target_chunk - 1) // target_chunk)
+            chunks = torch.chunk(x_flat, chunk_num, dim=0)
+
+            if inplace_safe:
+                # In-place path: write output directly into x (fused residual)
+                start = 0
+                for chunk in chunks:
+                    y = self.layernorm1(chunk)
+                    a = self.linear_no_bias_a(y)
+                    a = F.silu(a, True)
+                    b = self.linear_no_bias_b(y)
+                    del y
+                    b *= a
+                    del a
+                    b = self.linear_no_bias(b)
+                    x_flat[start : start + b.shape[0]] += b
+                    start += b.shape[0]
+                    del b
+                return x
+            else:
+                outputs = torch.empty(
+                    (total, self.c_in), dtype=x_flat.dtype, device=x_flat.device
+                )
+                start = 0
+                for chunk in chunks:
+                    y = self.layernorm1(chunk)
+                    a = self.linear_no_bias_a(y)
+                    a = F.silu(a, True)
+                    b = self.linear_no_bias_b(y)
+                    del y
+                    b *= a
+                    del a
+                    b = self.linear_no_bias(b)
+                    outputs[start : start + b.shape[0]] = b
+                    start += b.shape[0]
+                    del b
+                outputs = outputs.reshape(*other_dims, self.c_in)
+                return outputs
 
 
 def _attention(

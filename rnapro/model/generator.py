@@ -31,7 +31,7 @@ from typing import Any, Callable, Optional
 
 import torch
 
-from rnapro.model.utils import centre_random_augmentation
+from rnapro.model.utils import centre_random_augmentation, expand_at_dim
 
 
 class TrainingNoiseSampler:
@@ -184,7 +184,30 @@ def sample_diffusion(
     device = s_inputs.device
     dtype = s_inputs.dtype
 
+    # Pre-compute z_pair conditioning once (constant across all denoising steps)
+    # This avoids recomputing O(L^2) pair conditioning at every step.
+    z_pair_cached = None
+    if not torch.is_grad_enabled() and hasattr(denoise_net, 'diffusion_conditioning'):
+        with torch.no_grad():
+            z_pair_cached = denoise_net.diffusion_conditioning.forward_pair_conditioning(
+                asym_id=input_feature_dict["asym_id"],
+                residue_index=input_feature_dict["residue_index"],
+                entity_id=input_feature_dict["entity_id"],
+                token_index=input_feature_dict["token_index"],
+                sym_id=input_feature_dict["sym_id"],
+                z_trunk=z_trunk,
+                inplace_safe=False,
+                use_conditioning=True,
+            )
+
     def _chunk_sample_diffusion(chunk_n_sample, inplace_safe):
+        # Expand cached z_pair for this chunk's N_sample
+        chunk_z_pair = None
+        if z_pair_cached is not None:
+            chunk_z_pair = expand_at_dim(
+                z_pair_cached, dim=-4, n=chunk_n_sample
+            )  # [..., chunk_n_sample, N_token, N_token, c_z]
+
         # init noise
         # [..., N_sample, N_atom, 3]
         x_l = noise_schedule[0] * torch.randn(
@@ -228,6 +251,7 @@ def sample_diffusion(
                 z_trunk=z_trunk,
                 chunk_size=attn_chunk_size,
                 inplace_safe=inplace_safe,
+                z_pair_cached=chunk_z_pair,
             )
 
             delta = (x_noisy - x_denoised) / t_hat[

@@ -162,23 +162,25 @@ class PairformerBlock(nn.Module):
                 _add_with_inplace=True,
                 triangle_multiplicative=triangle_multiplicative,
             )
-            z += self.tri_att_start(
+            self.tri_att_start(
                 z,
                 mask=pair_mask,
                 triangle_attention=triangle_attention,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
+                _z_for_inplace=z,
             )
             z = z.transpose(-2, -3).contiguous()
-            z += self.tri_att_end(
+            self.tri_att_end(
                 z,
                 mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
                 triangle_attention=triangle_attention,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
+                _z_for_inplace=z,
             )
             z = z.transpose(-2, -3).contiguous()
-            z += self.pair_transition(z)
+            self.pair_transition(z, inplace_safe=True)
         else:
             tmu_update = self.tri_mul_out(
                 z,
@@ -654,9 +656,15 @@ class MSABlock(nn.Module):
         # Communication
         if (not self.training) and z.shape[-2] > 2000:
             torch.cuda.empty_cache()
-        z = z + self.outer_product_mean_msa(
-            m, inplace_safe=inplace_safe, chunk_size=chunk_size
-        )
+        if inplace_safe and chunk_size is not None:
+            self.outer_product_mean_msa(
+                m, inplace_safe=inplace_safe, chunk_size=chunk_size,
+                _z_for_inplace=z,
+            )
+        else:
+            z = z + self.outer_product_mean_msa(
+                m, inplace_safe=inplace_safe, chunk_size=chunk_size
+            )
         if (not self.training) and z.shape[-2] > 2000:
             torch.cuda.empty_cache()
         if not self.is_last_block:

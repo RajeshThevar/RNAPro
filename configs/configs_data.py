@@ -187,6 +187,11 @@ data_configs = {
     "epoch_size": 10000,
     "train_ref_pos_augment": True,
     "test_ref_pos_augment": True,
+    # Multi-chain fine-tuning paths (set via --data.bioassembly_dir etc.)
+    "bioassembly_dir": "",
+    "indices_csv": "",
+    "max_n_token": 5120,
+    "temporal_cutoff": "2025-05-09",
     "train_sets": ListValue(["weightedPDB_before2109_wopb_nometalc_0925"]),
     "train_sampler": {
         "train_sample_weights": ListValue([1.0]),

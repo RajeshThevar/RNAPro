@@ -612,7 +612,25 @@ class RibonanzaNet(nn.Module):
         else:
             return output
 
-    def get_embeddings(self, src, src_mask=None, return_aw=False):
+    def get_embeddings(self, src, src_mask=None, return_aw=False,
+                       layer_weights=None):
+        """Get weighted embeddings from all transformer layers.
+
+        Args:
+            src: Input token IDs [B, L]
+            src_mask: Source mask
+            return_aw: Whether to return attention weights
+            layer_weights: Optional [N_layers] tensor of pre-softmaxed weights.
+                If provided, computes weighted sum incrementally to avoid
+                stacking all 48 layers (saves ~5.6GB VRAM at L=500).
+                If None, falls back to stacking all layers (original behavior).
+
+        Returns:
+            If layer_weights is None:
+                (all_sequence_features [N, B, L, D], all_pairwise_features [N, B, L, L, D])
+            If layer_weights is provided:
+                (weighted_seq_features [B, L, D], weighted_pair_features [B, L, L, D])
+        """
         B, L = src.shape
         src = src
         src = self.encoder(src).reshape(B, L, -1)
@@ -626,20 +644,37 @@ class RibonanzaNet(nn.Module):
             pairwise_features = self.outer_product_mean(src)
             pairwise_features = pairwise_features + self.pos_encoder(src)
 
-        all_sequence_features = []
-        all_pairwise_features = []
-        for i, layer in enumerate(self.transformer_encoder):
-            src, pairwise_features = checkpoint.checkpoint(
-                self.custom(layer),
-                [src, pairwise_features, src_mask, return_aw],
-                use_reentrant=False,
-            )
-
-            all_sequence_features.append(src)
-            all_pairwise_features.append(pairwise_features)
-        all_sequence_features = torch.stack(all_sequence_features, 0)
-        all_pairwise_features = torch.stack(all_pairwise_features, 0)
-        return all_sequence_features, all_pairwise_features
+        if layer_weights is not None:
+            # Incremental aggregation: accumulate weighted sum layer-by-layer
+            # instead of stacking all 48 layers into [48, B, L, L, 128]
+            weights = layer_weights.softmax(0)
+            seq_accum = torch.zeros_like(src)
+            pair_accum = torch.zeros_like(pairwise_features)
+            for i, layer in enumerate(self.transformer_encoder):
+                src, pairwise_features = checkpoint.checkpoint(
+                    self.custom(layer),
+                    [src, pairwise_features, src_mask, return_aw],
+                    use_reentrant=False,
+                )
+                w = weights[i]
+                seq_accum = seq_accum + w * src
+                pair_accum = pair_accum + w * pairwise_features
+            return seq_accum, pair_accum
+        else:
+            # Original behavior: stack all layers (high memory)
+            all_sequence_features = []
+            all_pairwise_features = []
+            for i, layer in enumerate(self.transformer_encoder):
+                src, pairwise_features = checkpoint.checkpoint(
+                    self.custom(layer),
+                    [src, pairwise_features, src_mask, return_aw],
+                    use_reentrant=False,
+                )
+                all_sequence_features.append(src)
+                all_pairwise_features.append(pairwise_features)
+            all_sequence_features = torch.stack(all_sequence_features, 0)
+            all_pairwise_features = torch.stack(all_pairwise_features, 0)
+            return all_sequence_features, all_pairwise_features
 
 
 class TriangleAttention(nn.Module):

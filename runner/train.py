@@ -49,6 +49,7 @@ from configs.configs_model_type import model_configs
 from rnapro.config import parse_configs, parse_sys_args
 from rnapro.config.config import save_config
 from rnapro.data.rna_dataset_allatom_loader import get_dataloaders
+from rnapro.data.multichain_loader import get_multichain_dataloaders
 
 from rnapro.metrics.lddt_metrics import LDDTMetrics
 from rnapro.model.loss import RNAProLoss
@@ -234,7 +235,12 @@ class AF3Trainer(object):
 
     def init_data(self):
         self.configs.num_workers = 4
-        dataloader = get_dataloaders(configs=self.configs)
+        dataset_type = getattr(self.configs, "dataset_type", "rna_only")
+        if dataset_type == "multichain":
+            self.print("Using multi-chain dataset (bioassembly pipeline)")
+            dataloader = get_multichain_dataloaders(configs=self.configs)
+        else:
+            dataloader = get_dataloaders(configs=self.configs)
         self.train_dl, self.valid_dl_private = dataloader
         self.test_dls = {"private": self.valid_dl_private}
 

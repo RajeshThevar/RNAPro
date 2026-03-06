@@ -184,6 +184,79 @@ class DiffusionConditioning(nn.Module):
             torch.cuda.empty_cache()
         return single_s, pair_z
 
+    def forward_pair_conditioning(
+        self,
+        asym_id: torch.Tensor,
+        residue_index: torch.Tensor,
+        entity_id: torch.Tensor,
+        token_index: torch.Tensor,
+        sym_id: torch.Tensor,
+        z_trunk: torch.Tensor,
+        inplace_safe: bool = False,
+        use_conditioning: bool = True,
+    ) -> torch.Tensor:
+        """Compute pair conditioning z_pair only (cacheable across denoising steps).
+
+        Returns:
+            torch.Tensor: z_pair [..., N_tokens, N_tokens, c_z]
+        """
+        if not use_conditioning:
+            if inplace_safe:
+                z_trunk *= 0
+            else:
+                z_trunk = 0 * z_trunk
+        pair_z = torch.cat(
+            tensors=[
+                z_trunk,
+                self.relpe(asym_id, residue_index, entity_id, token_index, sym_id),
+            ],
+            dim=-1,
+        )
+        pair_z = self.linear_no_bias_z(self.layernorm_z(pair_z))
+        if inplace_safe:
+            pair_z += self.transition_z1(pair_z)
+            pair_z += self.transition_z2(pair_z)
+        else:
+            pair_z = pair_z + self.transition_z1(pair_z)
+            pair_z = pair_z + self.transition_z2(pair_z)
+        return pair_z
+
+    def forward_single_conditioning(
+        self,
+        t_hat_noise_level: torch.Tensor,
+        s_inputs: torch.Tensor,
+        s_trunk: torch.Tensor,
+        inplace_safe: bool = False,
+        use_conditioning: bool = True,
+    ) -> torch.Tensor:
+        """Compute single conditioning s_single only (changes each denoising step).
+
+        Returns:
+            torch.Tensor: s_single [..., N_sample, N_tokens, c_s]
+        """
+        if not use_conditioning:
+            if inplace_safe:
+                s_trunk *= 0
+            else:
+                s_trunk = 0 * s_trunk
+        single_s = torch.cat(
+            tensors=[s_trunk, s_inputs], dim=-1
+        )
+        single_s = self.linear_no_bias_s(self.layernorm_s(single_s))
+        noise_n = self.fourier_embedding(
+            t_hat_noise_level=torch.log(input=t_hat_noise_level / self.sigma_data) / 4
+        ).to(single_s.dtype)
+        single_s = single_s.unsqueeze(dim=-3) + self.linear_no_bias_n(
+            self.layernorm_n(noise_n)
+        ).unsqueeze(dim=-2)
+        if inplace_safe:
+            single_s += self.transition_s1(single_s)
+            single_s += self.transition_s2(single_s)
+        else:
+            single_s = single_s + self.transition_s1(single_s)
+            single_s = single_s + self.transition_s2(single_s)
+        return single_s
+
 
 class DiffusionSchedule:
     def __init__(
@@ -358,6 +431,7 @@ class DiffusionModule(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         use_conditioning: bool = True,
+        z_pair_cached: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """The raw network to be trained.
         As in EDM equation (7), this is F_theta(c_in * x, c_noise(sigma)).
@@ -389,10 +463,19 @@ class DiffusionModule(nn.Module):
         blocks_per_ckpt = self.blocks_per_ckpt
         if not torch.is_grad_enabled():
             blocks_per_ckpt = None
-        # Conditioning, shared across difference samples
-        # Diffusion_conditioning consumes 7-8G when token num is 768,
-        # use checkpoint here if blocks_per_ckpt is not None.
-        if blocks_per_ckpt:
+
+        if z_pair_cached is not None:
+            # Use pre-computed z_pair (already expanded for N_sample)
+            z_pair = z_pair_cached
+            s_single = self.diffusion_conditioning.forward_single_conditioning(
+                t_hat_noise_level,
+                s_inputs=s_inputs,
+                s_trunk=s_trunk,
+                inplace_safe=inplace_safe,
+                use_conditioning=use_conditioning,
+            )
+        elif blocks_per_ckpt:
+            # Training path with gradient checkpointing
             checkpoint_fn = get_checkpoint_fn()
             s_single, z_pair = checkpoint_fn(
                 self.diffusion_conditioning,
@@ -431,9 +514,10 @@ class DiffusionModule(nn.Module):
         s_trunk = expand_at_dim(
             s_trunk, dim=-3, n=N_sample
         )  # [..., N_sample, N_token, c_s]
-        z_pair = expand_at_dim(
-            z_pair, dim=-4, n=N_sample
-        )  # [..., N_sample, N_token, N_token, c_z]
+        if z_pair_cached is None:
+            z_pair = expand_at_dim(
+                z_pair, dim=-4, n=N_sample
+            )  # [..., N_sample, N_token, N_token, c_z]
         # Fine-grained checkpoint for finetuning stage 2 (token num: 768) for avoiding OOM
         if blocks_per_ckpt and self.use_fine_grained_checkpoint:
             checkpoint_fn = get_checkpoint_fn()
@@ -517,6 +601,7 @@ class DiffusionModule(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         use_conditioning: bool = True,
+        z_pair_cached: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """One step denoise: x_noisy, noise_level -> x_denoised
 
@@ -562,6 +647,7 @@ class DiffusionModule(nn.Module):
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
             use_conditioning=use_conditioning,
+            z_pair_cached=z_pair_cached,
         )
 
         # Rescale updates to positions and combine with input positions

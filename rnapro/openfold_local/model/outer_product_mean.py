@@ -99,21 +99,57 @@ class OuterProductMean(nn.Module):
 
         return outer
 
+    @torch.jit.ignore
+    def _inplace_chunk(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        norm: torch.Tensor,
+        z: torch.Tensor,
+        chunk_size: int,
+    ) -> None:
+        """In-place row-wise OPM with fused residual addition.
+
+        Processes row-chunks of the outer product and writes
+        ``z[row_chunk] += opm_output / norm`` directly, avoiding a full
+        [N_res, N_res, C_z] output buffer.
+
+        Args:
+            a: [*, N_res, N_seq, C] projected MSA (transposed).
+            b: [*, N_res, N_seq, C] projected MSA (transposed).
+            norm: [*, N_res, N_res, 1] normalisation denominator.
+            z: [*, N_res, N_res, C_z] pair tensor -- modified **in-place**.
+            chunk_size: Number of rows per chunk.
+        """
+        N_res = a.shape[-3]
+        for i_start in range(0, N_res, chunk_size):
+            i_end = min(i_start + chunk_size, N_res)
+            a_chunk = a[..., i_start:i_end, :, :]  # [*, chunk, N_seq, C]
+            # b is full -- needed for the einsum contraction over N_res
+            outer_chunk = self._opm(a_chunk, b)  # [*, chunk, N_res, C_z]
+            outer_chunk /= norm[..., i_start:i_end, :, :]
+            z[..., i_start:i_end, :, :] += outer_chunk
+            del outer_chunk, a_chunk
+
     def _forward(
         self,
         m: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         chunk_size: Optional[int] = None,
         inplace_safe: bool = False,
-    ) -> torch.Tensor:
+        _z_for_inplace: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         """
         Args:
             m:
                 [*, N_seq, N_res, C_m] MSA embedding
             mask:
                 [*, N_seq, N_res] MSA mask
+            _z_for_inplace:
+                When provided, accumulates the OPM output directly into
+                this tensor via ``z += opm_result``. Returns None.
         Returns:
-            [*, N_res, N_res, C_z] pair embedding update
+            [*, N_res, N_res, C_z] pair embedding update, or None if in-place.
         """
         if mask is None:
             mask = m.new_ones(m.shape[:-1])
@@ -134,14 +170,18 @@ class OuterProductMean(nn.Module):
         a = a.transpose(-2, -3)
         b = b.transpose(-2, -3)
 
+        # [*, N_res, N_res, 1]
+        norm = torch.einsum("...abc,...adc->...bdc", mask, mask)
+        norm = norm + self.eps
+
+        if _z_for_inplace is not None and chunk_size is not None:
+            self._inplace_chunk(a, b, norm, _z_for_inplace, chunk_size)
+            return None
+
         if chunk_size is not None:
             outer = self._chunk(a, b, chunk_size)
         else:
             outer = self._opm(a, b)
-
-        # [*, N_res, N_res, 1]
-        norm = torch.einsum("...abc,...adc->...bdc", mask, mask)
-        norm = norm + self.eps
 
         # [*, N_res, N_res, C_z]
         if inplace_safe:
@@ -157,9 +197,16 @@ class OuterProductMean(nn.Module):
         mask: Optional[torch.Tensor] = None,
         chunk_size: Optional[int] = None,
         inplace_safe: bool = False,
-    ) -> torch.Tensor:
+        _z_for_inplace: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         if is_fp16_enabled():
             with torch.amp.autocast("cuda", enabled=False):
-                return self._forward(m.float(), mask, chunk_size, inplace_safe)
+                return self._forward(
+                    m.float(), mask, chunk_size, inplace_safe,
+                    _z_for_inplace=_z_for_inplace,
+                )
         else:
-            return self._forward(m, mask, chunk_size, inplace_safe)
+            return self._forward(
+                m, mask, chunk_size, inplace_safe,
+                _z_for_inplace=_z_for_inplace,
+            )
