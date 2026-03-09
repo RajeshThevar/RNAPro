@@ -38,10 +38,14 @@ from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
-import wandb
 from ml_collections.config_dict import ConfigDict
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
+
+try:
+    import wandb
+except ImportError:  # pragma: no cover - optional dependency for local runs
+    wandb = None
 
 from configs.configs_base import configs as configs_base
 from configs.configs_data import data_configs
@@ -121,6 +125,11 @@ class AF3Trainer(object):
 
     def init_log(self):
         if self.configs.use_wandb and DIST_WRAPPER.rank == 0:
+            if wandb is None:
+                raise ImportError(
+                    "wandb is not installed, but configs.use_wandb=True. "
+                    "Install wandb or disable wandb logging."
+                )
             wandb.init(
                 project=self.configs.project,
                 name=self.run_name,
@@ -130,14 +139,20 @@ class AF3Trainer(object):
         self.train_metric_wrapper = SimpleMetricAggregator(["avg"])
 
     def init_env(self):
-        """Init pytorch/cuda envs."""
+        """Init pytorch accelerator envs."""
         logging.info(
             f"Distributed environment: world size: {DIST_WRAPPER.world_size}, "
             + f"global rank: {DIST_WRAPPER.rank}, local rank: {DIST_WRAPPER.local_rank}"
         )
-        self.use_cuda = torch.cuda.device_count() > 0
+        self.use_cuda = torch.cuda.is_available()
+        self.use_mps = (
+            hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_built()
+            and torch.backends.mps.is_available()
+        )
         if self.use_cuda:
             self.device = torch.device("cuda:{}".format(DIST_WRAPPER.local_rank))
+            self.accelerator_type = "cuda"
             os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
             all_gpu_ids = ",".join(str(x) for x in range(torch.cuda.device_count()))
             devices = os.getenv("CUDA_VISIBLE_DEVICES", all_gpu_ids)
@@ -145,12 +160,30 @@ class AF3Trainer(object):
                 f"LOCAL_RANK: {DIST_WRAPPER.local_rank} - CUDA_VISIBLE_DEVICES: [{devices}]"
             )
             torch.cuda.set_device(self.device)
+            enable_tf32 = os.environ.get("RNAPRO_ENABLE_TF32", "1").lower() not in {
+                "0",
+                "false",
+                "no",
+            }
+            torch.backends.cuda.matmul.allow_tf32 = enable_tf32
+            if hasattr(torch.backends, "cudnn"):
+                torch.backends.cudnn.allow_tf32 = enable_tf32
+            logging.info(
+                "TF32 matmul/cudnn enabled on CUDA: %s",
+                enable_tf32,
+            )
+        elif self.use_mps:
+            self.device = torch.device("mps")
+            self.accelerator_type = "mps"
+            logging.info("Using Apple Metal Performance Shaders (MPS)")
         else:
             self.device = torch.device("cpu")
+            self.accelerator_type = "cpu"
         if DIST_WRAPPER.world_size > 1:
             timeout_seconds = int(os.environ.get("NCCL_TIMEOUT_SECOND", 600))
             dist.init_process_group(
-                backend="nccl", timeout=datetime.timedelta(seconds=timeout_seconds)
+                backend="nccl" if self.use_cuda else "gloo",
+                timeout=datetime.timedelta(seconds=timeout_seconds),
             )
         if not self.configs.deterministic_seed:
             # use rank-specific seed
@@ -172,6 +205,12 @@ class AF3Trainer(object):
             ), "if use ds4sci, set env as https://www.deepspeed.ai/tutorials/ds4sci_evoformerattention/"
         logging.info("Finished init ENV.")
 
+    def empty_cache(self):
+        if self.use_cuda:
+            torch.cuda.empty_cache()
+        elif self.use_mps and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+
     def init_loss(self):
         self.loss = RNAProLoss(self.configs)
         self.symmetric_permutation = SymmetricPermutation(
@@ -186,13 +225,16 @@ class AF3Trainer(object):
             self.print("Using DDP")
             self.use_ddp = True
             # Fix DDP/checkpoint https://discuss.pytorch.org/t/ddp-and-gradient-checkpointing/132244
-            self.model = DDP(
-                self.raw_model,
-                find_unused_parameters=self.configs.find_unused_parameters,
-                device_ids=[DIST_WRAPPER.local_rank],
-                output_device=DIST_WRAPPER.local_rank,
-                static_graph=True,
-            )
+            ddp_kwargs = {
+                "find_unused_parameters": self.configs.find_unused_parameters,
+                "static_graph": True,
+            }
+            if self.use_cuda:
+                ddp_kwargs.update(
+                    device_ids=[DIST_WRAPPER.local_rank],
+                    output_device=DIST_WRAPPER.local_rank,
+                )
+            self.model = DDP(self.raw_model, **ddp_kwargs)
         else:
             self.model = self.raw_model
 
@@ -210,7 +252,7 @@ class AF3Trainer(object):
             )
             self.ema_wrapper.register()
 
-        torch.cuda.empty_cache()
+        self.empty_cache()
         self.optimizer = get_optimizer(
             self.configs,
             self.model,
@@ -236,13 +278,22 @@ class AF3Trainer(object):
     def init_data(self):
         self.configs.num_workers = 4
         dataset_type = getattr(self.configs, "dataset_type", "rna_only")
+        build_val = bool(
+            self.configs.eval_only
+            or self.configs.eval_first
+            or self.configs.eval_interval > 0
+        )
         if dataset_type == "multichain":
             self.print("Using multi-chain dataset (bioassembly pipeline)")
             dataloader = get_multichain_dataloaders(configs=self.configs)
         else:
-            dataloader = get_dataloaders(configs=self.configs)
+            dataloader = get_dataloaders(configs=self.configs, build_val=build_val)
         self.train_dl, self.valid_dl_private = dataloader
-        self.test_dls = {"private": self.valid_dl_private}
+        self.test_dls = (
+            {"private": self.valid_dl_private}
+            if self.valid_dl_private is not None
+            else {}
+        )
 
     def save_checkpoint(self, ema_suffix=""):
         if DIST_WRAPPER.rank == 0:
@@ -530,8 +581,8 @@ class AF3Trainer(object):
             "fp16": torch.float16,
         }[self.configs.dtype]
         enable_amp = (
-            torch.autocast(device_type="cuda", dtype=eval_precision)
-            if torch.cuda.is_available()
+            torch.autocast(device_type=self.accelerator_type, dtype=eval_precision)
+            if self.accelerator_type in {"cuda", "mps"}
             else nullcontext()
         )
         self.model.eval()
@@ -582,7 +633,7 @@ class AF3Trainer(object):
                 del batch, simple_metrics
                 if index % 5 == 0:
                     # Release some memory periodically
-                    torch.cuda.empty_cache()
+                    self.empty_cache()
 
             metrics = simple_metric_wrapper.calc()
             self.print(f"Step {self.step}, eval {test_name}: {metrics}")
@@ -606,15 +657,17 @@ class AF3Trainer(object):
         }[self.configs.dtype]
         enable_amp = (
             torch.autocast(
-                device_type="cuda", dtype=train_precision, cache_enabled=False
+                device_type=self.accelerator_type,
+                dtype=train_precision,
+                cache_enabled=False,
             )
-            if torch.cuda.is_available()
+            if self.accelerator_type in {"cuda", "mps"}
             else nullcontext()
         )
 
-        scaler = torch.GradScaler(
-            device="cuda" if torch.cuda.is_available() else "cpu",
-            enabled=(self.configs.dtype == "float16"),
+        scaler = torch.amp.GradScaler(
+            device=self.accelerator_type if self.accelerator_type in {"cuda", "mps"} else "cpu",
+            enabled=(self.configs.dtype == "fp16"),
         )
 
         with enable_amp:
@@ -644,27 +697,28 @@ class AF3Trainer(object):
             if "loss" not in key:
                 continue
             self.train_metric_wrapper.add(key, value, namespace="train")
-        torch.cuda.empty_cache()
+        self.empty_cache()
 
     def progress_bar(self, desc: str = ""):
         if DIST_WRAPPER.rank != 0:
             return
-        if self.global_step % (
-            self.configs.eval_interval * self.iters_to_accumulate
-        ) == 0 or (not hasattr(self, "_ipbar")):
+        total = max(
+            1,
+            self.configs.eval_interval * self.iters_to_accumulate,
+        )
+        if self.global_step % total == 0 or (not hasattr(self, "_ipbar")):
             # Start a new progress bar
             self._pbar = tqdm(
                 range(
-                    self.global_step
-                    % (self.iters_to_accumulate * self.configs.eval_interval),
-                    self.iters_to_accumulate * self.configs.eval_interval,
+                    self.global_step % total,
+                    total,
                 )
             )
             self._ipbar = iter(self._pbar)
 
         step = next(self._ipbar)
         self._pbar.set_description(
-            f"[step {self.step}: {step}/{self.iters_to_accumulate * self.configs.eval_interval}] {desc}"
+            f"[step {self.step}: {step}/{total}] {desc}"
         )
         return
 
@@ -733,7 +787,10 @@ class AF3Trainer(object):
                         )
                         self.ema_wrapper.restore()
 
-                if step_need_eval or is_last_step:
+                should_eval = step_need_eval or (
+                    is_last_step and self.configs.eval_interval > 0
+                )
+                if should_eval:
                     self.evaluate()
                 self.global_step += 1
                 if self.global_step % self.iters_to_accumulate == 0:
