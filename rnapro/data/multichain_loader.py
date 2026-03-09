@@ -10,8 +10,10 @@ that AF3Trainer.init_data() can swap between loaders based on config.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Optional
 
+import pandas as pd
 from ml_collections.config_dict import ConfigDict
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -21,6 +23,108 @@ from rnapro.utils.distributed import DIST_WRAPPER
 from rnapro.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _deterministic_holdout_pdbs(
+    pdb_ids: list[str],
+    holdout_fraction: float = 0.05,
+) -> tuple[list[str], list[str]]:
+    """Create a deterministic PDB-level holdout split.
+
+    Used as a leakage-safe fallback when temporal_cutoff does not yield a
+    non-empty validation set.
+    """
+    unique_ids = sorted(set(pdb_ids))
+    if len(unique_ids) <= 1:
+        return unique_ids, []
+
+    n_holdout = max(1, int(round(len(unique_ids) * holdout_fraction)))
+    ranked = sorted(
+        unique_ids,
+        key=lambda pdb_id: hashlib.md5(pdb_id.encode("utf-8")).hexdigest(),
+    )
+    val_pdbs = ranked[:n_holdout]
+    train_pdbs = [pdb_id for pdb_id in ranked if pdb_id not in set(val_pdbs)]
+    return train_pdbs, val_pdbs
+
+
+def _build_pdb_split(
+    indices_csv: str,
+    temporal_cutoff: str,
+) -> tuple[list[str], list[str]]:
+    """Build leakage-safe train/val PDB splits from indices.csv."""
+    indices_df = pd.read_csv(indices_csv)
+    if "pdb_id" not in indices_df.columns:
+        raise ValueError(f"indices.csv missing pdb_id column: {indices_csv}")
+
+    pdb_ids = sorted(indices_df["pdb_id"].astype(str).unique())
+    if len(pdb_ids) <= 1:
+        return pdb_ids, []
+
+    if "release_date" not in indices_df.columns:
+        logger.warning(
+            "indices.csv has no release_date column; using deterministic "
+            "PDB-level holdout for validation."
+        )
+        return _deterministic_holdout_pdbs(pdb_ids)
+
+    cutoff_ts = pd.to_datetime(temporal_cutoff, errors="coerce")
+    if pd.isna(cutoff_ts):
+        raise ValueError(f"Invalid temporal_cutoff: {temporal_cutoff}")
+
+    dated = indices_df[["pdb_id", "release_date"]].copy()
+    dated["release_date"] = pd.to_datetime(dated["release_date"], errors="coerce")
+    pdb_dates = (
+        dated.groupby("pdb_id", as_index=False)["release_date"]
+        .min()
+        .sort_values(["release_date", "pdb_id"], na_position="last")
+    )
+
+    train_pdbs = pdb_dates.loc[
+        pdb_dates["release_date"].notna()
+        & (pdb_dates["release_date"] <= cutoff_ts),
+        "pdb_id",
+    ].astype(str).tolist()
+    val_pdbs = pdb_dates.loc[
+        pdb_dates["release_date"].notna()
+        & (pdb_dates["release_date"] > cutoff_ts),
+        "pdb_id",
+    ].astype(str).tolist()
+
+    if not val_pdbs:
+        logger.warning(
+            "Temporal cutoff %s produced an empty validation split; holding out "
+            "the newest PDBs instead.",
+            temporal_cutoff,
+        )
+        dated_only = pdb_dates[pdb_dates["release_date"].notna()]
+        if len(dated_only) > 1:
+            n_holdout = max(1, int(round(len(dated_only) * 0.05)))
+            val_pdbs = dated_only.tail(n_holdout)["pdb_id"].astype(str).tolist()
+            train_pdbs = [
+                pdb_id
+                for pdb_id in pdb_ids
+                if pdb_id not in set(val_pdbs)
+            ]
+        else:
+            train_pdbs, val_pdbs = _deterministic_holdout_pdbs(pdb_ids)
+
+    if not train_pdbs:
+        logger.warning(
+            "Temporal cutoff %s produced an empty training split; falling back "
+            "to deterministic PDB-level holdout.",
+            temporal_cutoff,
+        )
+        train_pdbs, val_pdbs = _deterministic_holdout_pdbs(pdb_ids)
+
+    if not val_pdbs:
+        logger.warning(
+            "Validation split is still empty after fallbacks; reusing the "
+            "training set for validation as a last resort."
+        )
+        val_pdbs = list(train_pdbs)
+
+    return sorted(set(train_pdbs)), sorted(set(val_pdbs))
 
 
 def get_multichain_dataloaders(
@@ -48,6 +152,18 @@ def get_multichain_dataloaders(
     indices_csv = configs.data.indices_csv
     max_n_token = configs.data.get("max_n_token", 5120)
     temporal_cutoff = configs.data.get("temporal_cutoff", "2025-05-09")
+    train_pdbs, val_pdbs = _build_pdb_split(indices_csv, temporal_cutoff)
+    overlap = set(train_pdbs) & set(val_pdbs)
+    if overlap:
+        raise ValueError(
+            f"Train/val PDB overlap detected in multichain split: {sorted(overlap)[:5]}"
+        )
+    logger.info(
+        "Multi-chain temporal split: cutoff=%s train_pdb=%d val_pdb=%d",
+        temporal_cutoff,
+        len(train_pdbs),
+        len(val_pdbs),
+    )
 
     # Common dataset kwargs
     dataset_kwargs = {
@@ -74,16 +190,18 @@ def get_multichain_dataloaders(
     # Training dataset
     train_dataset = MultiChainDataset(
         name="multichain_train",
+        pdb_list=train_pdbs,
         **dataset_kwargs,
     )
 
-    # Validation dataset - same data, no augmentation
+    # Validation dataset - held-out PDBs, no augmentation
     val_kwargs = dataset_kwargs.copy()
     val_kwargs["ref_pos_augment"] = False
     val_kwargs["shuffle_mols"] = False
     val_kwargs["shuffle_sym_ids"] = False
     val_kwargs["random_sample_if_failed"] = False
     val_kwargs["name"] = "multichain_val"
+    val_kwargs["pdb_list"] = val_pdbs
 
     val_dataset = MultiChainDataset(**val_kwargs)
 
