@@ -31,28 +31,68 @@
 import importlib
 import numbers
 import os
+import shutil
 import sys
+from pathlib import Path
 
 import torch
 from torch.nn.parameter import Parameter
 
 sys.path.append(os.path.dirname(__file__))
 
-try:
-    fast_layer_norm_cuda_v2 = importlib.import_module("fast_layer_norm_cuda_v2")
-except ImportError:
-    from rnapro.model.layer_norm.torch_ext_compile import compile
 
+def _cleanup_fast_layernorm_artifacts(current_dir: str):
+    """Remove partial build outputs that can poison a retry."""
+    for name in [
+        "fast_layer_norm_cuda_v2.so",
+        "build.ninja",
+        ".ninja_log",
+        ".ninja_deps",
+        "lock",
+    ]:
+        path = Path(current_dir) / name
+        if path.exists():
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+            except OSError:
+                pass
+
+
+def _load_fast_layernorm_extension():
     current_dir = os.path.dirname(__file__)
-    fast_layer_norm_cuda_v2 = compile(
-        name="fast_layer_norm_cuda_v2",
-        sources=[
+    try:
+        return importlib.import_module("fast_layer_norm_cuda_v2")
+    except ImportError:
+        from rnapro.model.layer_norm.torch_ext_compile import compile
+
+        sources = [
             os.path.join(f"{current_dir}/kernel", file)
             for file in ["layer_norm_cuda.cpp", "layer_norm_cuda_kernel.cu"]
-        ],
-        extra_include_paths=[f"{current_dir}/kernel"],
-        build_directory=current_dir,
-    )
+        ]
+        extra_include_paths = [f"{current_dir}/kernel"]
+
+        try:
+            return compile(
+                name="fast_layer_norm_cuda_v2",
+                sources=sources,
+                extra_include_paths=extra_include_paths,
+                build_directory=current_dir,
+            )
+        except Exception:
+            _cleanup_fast_layernorm_artifacts(current_dir)
+            build_dir = os.path.join(current_dir, ".build_fast_layernorm")
+            os.makedirs(build_dir, exist_ok=True)
+            return compile(
+                name="fast_layer_norm_cuda_v2",
+                sources=sources,
+                extra_include_paths=extra_include_paths,
+                build_directory=build_dir,
+            )
+
+fast_layer_norm_cuda_v2 = _load_fast_layernorm_extension()
 
 
 class FusedLayerNormAffineFunction(torch.autograd.Function):
