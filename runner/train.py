@@ -309,6 +309,15 @@ class AF3Trainer(object):
                 "step": self.step,
             }
             torch.save(checkpoint, path)
+            marker_path = os.path.join(self.checkpoint_dir, "latest_checkpoint.txt")
+            marker_lines = [
+                f"step={self.step}",
+                f"checkpoint={self.step}.pt",
+                f"ema_checkpoint={self.step}_ema_0.995.pt",
+                f"updated_from={os.path.basename(path)}",
+            ]
+            with open(marker_path, "w", encoding="utf-8") as marker_f:
+                marker_f.write("\n".join(marker_lines) + "\n")
             self.print(f"Saved checkpoint to {path}")
 
     def find_checkpoint_pairs_in_directory(
@@ -477,6 +486,36 @@ class AF3Trainer(object):
                 except Exception as e:
                     self.print(f"Failed to load checkpoint: {e}")
                     continue
+
+        elif os.path.isfile(self.configs.load_checkpoint_path):
+            # Single file given without EMA pair (e.g. pretrained .ckpt)
+            checkpoint_path = self.configs.load_checkpoint_path
+            print("#" * 20, "single checkpoint", checkpoint_path)
+            _load_checkpoint(
+                checkpoint_path,
+                self.configs.load_params_only,
+                skip_load_optimizer=self.configs.skip_load_optimizer,
+                skip_load_scheduler=self.configs.skip_load_scheduler,
+                skip_load_step=self.configs.skip_load_step,
+            )
+            # Re-register EMA shadow from loaded weights (otherwise shadow
+            # retains random init weights from init_model).
+            if hasattr(self, "ema_wrapper"):
+                self.ema_wrapper.register()
+            print(f"Loaded checkpoint: {checkpoint_path}")
+
+        elif self.configs.load_checkpoint_path:
+            # Path was provided but didn't match any branch
+            logging.warning(
+                "WARNING: --load_checkpoint_path='%s' was provided but no "
+                "checkpoint was loaded! isfile=%s isdir=%s "
+                "ema_isfile=%s. Model is using RANDOM weights.",
+                self.configs.load_checkpoint_path,
+                os.path.isfile(self.configs.load_checkpoint_path),
+                os.path.isdir(self.configs.load_checkpoint_path),
+                os.path.isfile(self.configs.load_ema_checkpoint_path),
+            )
+
         """
         # Load EMA model parameters
         if self.configs.load_ema_checkpoint_path:
