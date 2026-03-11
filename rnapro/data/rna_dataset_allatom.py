@@ -36,12 +36,13 @@ Key Components:
     - Helper methods: cropping, MSA reading, template processing, feature assembly
 """
 
+import os
+import json
 import traceback
 import warnings
 from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
-import os
 from typing import Any, Callable, Mapping, Optional, Union
 
 import numpy as np
@@ -110,6 +111,7 @@ DEFAULT_CROP_SIZE = 256
 INVALID_COORDINATE_VALUE = -1e8
 TOKEN_COUNT_DEFAULT = 1
 ZERO_COORDINATE = np.array([0.0, 0.0, 0.0])
+ATOM_NAME_TO_INDEX = {atom_name: idx for idx, atom_name in enumerate(ATOM_NAMES)}
 
 # Template limits
 MAX_TEMPLATES = 4  # Maximum number of templates read per target (up to 40 available)
@@ -209,9 +211,13 @@ class RNADataset(Dataset):
         sequences_csv_fpath = Path(os.path.join(data_dir, 'train_sequences.v2.1.csv'))
         coords_csv_fpath = Path(os.path.join(data_dir, 'train_allatom.v2.1.csv'))
         templates_csv_fpath = Path(os.path.join(data_dir, 'train_templates.v2.1.csv'))
-        self.template_features = torch.load(os.path.join(data_dir, 'template_features.pt'), weights_only=False)
-
-        self.template_features_names = list(self.template_features.keys())
+        target_resolution_fpath = Path(os.path.join(data_dir, 'target_resolution.json'))
+        self.template_features = {}
+        self.template_features_names = []
+        if self.use_template == 'ca_precomputed':
+            template_pt_fpath = os.path.join(data_dir, 'template_features.pt')
+            self.template_features = torch.load(template_pt_fpath, weights_only=False)
+            self.template_features_names = list(self.template_features.keys())
         self.inference_mode = mode == 'test'
         # Validate inputs
         # Check file existence
@@ -224,7 +230,7 @@ class RNADataset(Dataset):
             # raise ValueError(f"max_n_token must be positive or -1 (no limit), got: {max_n_token}")
             
         # Validate templates file if provided
-        if templates_csv_fpath and not Path(templates_csv_fpath).exists():
+        if self.use_template == 'ca' and templates_csv_fpath and not Path(templates_csv_fpath).exists():
             raise FileNotFoundError(f"Templates file not found: {templates_csv_fpath}")
         
         rna_msa_dir = Path(msa_dir)
@@ -241,6 +247,7 @@ class RNADataset(Dataset):
         self.template_featurizer = None
         self.rna_msa_dir = Path(rna_msa_dir) if rna_msa_dir else None
         self.rna_msa_seq_limit = min(MSA_MAX_SIZE, SEQ_LIMITS.get("nucleotide", 10000)) + 1
+        self.target_resolution = self._load_target_resolution_map(target_resolution_fpath)
 
         # Read data - always use all-atom format
         # First read sequences with temporal filtering to get the list of valid target_ids
@@ -257,7 +264,7 @@ class RNADataset(Dataset):
         self._validate_sequence_consistency()
 
         # Read template data if provided
-        if self.templates_csv_fpath:
+        if self.templates_csv_fpath and self.use_template == 'ca':
             self.templates_dict = self.read_templates(
                 templates_csv_fpath=self.templates_csv_fpath,
                 valid_target_ids=valid_target_ids
@@ -283,6 +290,37 @@ class RNADataset(Dataset):
             'PAD': 4,
             'X': 5,
         }
+
+    @staticmethod
+    def _load_target_resolution_map(
+        target_resolution_fpath: Path,
+    ) -> dict[str, float]:
+        if not target_resolution_fpath.exists():
+            return {}
+        try:
+            with target_resolution_fpath.open() as f:
+                raw_map = json.load(f)
+        except Exception as e:
+            logger.warning(
+                "Failed to load target resolution map %s: %s",
+                target_resolution_fpath,
+                e,
+            )
+            return {}
+
+        resolution_map = {}
+        for target_id, resolution in raw_map.items():
+            try:
+                resolution_map[str(target_id)] = float(resolution)
+            except (TypeError, ValueError):
+                continue
+
+        logger.info(
+            "Loaded target resolution map: %d entries from %s",
+            len(resolution_map),
+            target_resolution_fpath,
+        )
+        return resolution_map
 
     
     def read_sequences(
@@ -379,54 +417,56 @@ class RNADataset(Dataset):
             Missing coordinates filled with INVALID_COORDINATE_VALUE (-1e8).
         """
         
-        try:
-            df = pd.read_csv(coords_csv_fpath)
-        except Exception as e:
-            raise FileNotFoundError(f"Failed to read coordinates CSV file {coords_csv_fpath}: {e}") from e
-        
-        df.fillna(INVALID_COORDINATE_VALUE, inplace=True)
-        
-        # Pre-compute target_ids to avoid string operations in loop
-        df['target_id'] = df['ID'].str.rsplit('_', n=1).str[0]
-        
-        # Filter to only valid target IDs early to save processing time
-        df = df[df['target_id'].isin(valid_target_ids)]
-        
-        if len(df) == 0:
-            logger.warning("No labels found for any of the valid target IDs")
-            return {}
-        
         # Prepare coordinate column names for vectorized extraction
         coord_cols = []
         for atom_name in ATOM_NAMES:
             coord_cols.extend([f"{atom_name}_x_1", f"{atom_name}_y_1", f"{atom_name}_z_1"])
-        
-        # Group by target_id and process efficiently
-        coords_dict = {}
-        
-        for target_id, group in tqdm(df.groupby('target_id'), desc="Processing sequences"):
-            # Build sequence string efficiently
-            seq = ''.join(group['resname'].values)
-            
-            # Extract all coordinates at once as numpy array
-            coords_matrix = group[coord_cols].values.astype(np.float32)  # Shape: (n_residues, n_atoms*3)
-            
-            # Reshape and organize coordinates by atom type
-            n_residues = len(group)
-            n_atoms = len(ATOM_NAMES)
-            coords_reshaped = coords_matrix.reshape(n_residues, n_atoms, 3)
-            
-            # Convert to list of dictionaries for each residue
-            xyz_list = []
-            for i in range(n_residues):
-                xyzs = {}
-                for j, atom_name in enumerate(ATOM_NAMES):
-                    xyzs[atom_name] = coords_reshaped[i, j]
-                xyz_list.append(xyzs)
-            
-            coords_dict[target_id] = {"seq": seq, "xyz": xyz_list}
+        usecols = ["ID", "resname"] + coord_cols
 
-        return coords_dict
+        coords_dict = {}
+        try:
+            chunk_iter = pd.read_csv(
+                coords_csv_fpath,
+                usecols=usecols,
+                chunksize=50000,
+            )
+        except Exception as e:
+            raise FileNotFoundError(f"Failed to read coordinates CSV file {coords_csv_fpath}: {e}") from e
+
+        saw_any_rows = False
+        for chunk in tqdm(chunk_iter, desc="Processing coordinate chunks"):
+            chunk.fillna(INVALID_COORDINATE_VALUE, inplace=True)
+            chunk["target_id"] = chunk["ID"].str.rsplit("_", n=1).str[0]
+            chunk = chunk[chunk["target_id"].isin(valid_target_ids)]
+            if chunk.empty:
+                continue
+            saw_any_rows = True
+            for target_id, group in chunk.groupby("target_id", sort=False):
+                seq = "".join(group["resname"].values)
+                coords_matrix = group[coord_cols].to_numpy(dtype=np.float32, copy=False)
+                coords_reshaped = coords_matrix.reshape(len(group), len(ATOM_NAMES), 3)
+
+                if target_id in coords_dict:
+                    coords_dict[target_id]["seq_parts"].append(seq)
+                    coords_dict[target_id]["xyz_parts"].append(coords_reshaped.copy())
+                else:
+                    coords_dict[target_id] = {
+                        "seq_parts": [seq],
+                        "xyz_parts": [coords_reshaped.copy()],
+                    }
+
+        if not saw_any_rows:
+            logger.warning("No labels found for any of the valid target IDs")
+            return {}
+
+        compact_coords_dict = {}
+        for target_id, parts in tqdm(coords_dict.items(), desc="Compacting coordinates"):
+            compact_coords_dict[target_id] = {
+                "seq": "".join(parts["seq_parts"]),
+                "xyz": np.concatenate(parts["xyz_parts"], axis=0),
+            }
+
+        return compact_coords_dict
 
     def read_templates(
         self, templates_csv_fpath: Union[str, Path], valid_target_ids: set[str]
@@ -550,7 +590,7 @@ class RNADataset(Dataset):
     def _apply_sequence_cropping(
         self,
         single_sample_dict: Mapping[str, Any],
-        xyz_dict_list: list[dict],
+        xyz_dict_list: np.ndarray,
         seq: str
     ) -> tuple[dict, list[dict], Optional[np.ndarray], list[dict], int]:
         """
@@ -691,18 +731,17 @@ class RNADataset(Dataset):
         for token_idx, token in enumerate(token_array):
             for atom_idx in token.atom_indices:
                 atom = atom_array[atom_idx]
-                if atom.atom_name in cropped_xyz_dict_list[token_idx]:
-                    coord = cropped_xyz_dict_list[token_idx][atom.atom_name]
-                    coordinate_list.append(coord)
-                    # Check for invalid coordinates (missing atoms marked with large negative values)
-                    if coord[0] <= INVALID_COORDINATE_VALUE:
-                        coordinate_mask_list.append(0)
-                    else:
-                        coordinate_mask_list.append(1)
-                else:
-                    # Missing atom - add zero coordinates and mask as invalid
+                atom_array_idx = ATOM_NAME_TO_INDEX.get(atom.atom_name)
+                if atom_array_idx is None:
                     coordinate_list.append(ZERO_COORDINATE.copy())
                     coordinate_mask_list.append(0)
+                    continue
+                coord = cropped_xyz_dict_list[token_idx, atom_array_idx]
+                coordinate_list.append(coord)
+                if coord[0] <= INVALID_COORDINATE_VALUE:
+                    coordinate_mask_list.append(0)
+                else:
+                    coordinate_mask_list.append(1)
 
         return coordinate_list, coordinate_mask_list
 
@@ -938,7 +977,7 @@ class RNADataset(Dataset):
     
     def _create_masked_template_features(
         self,
-        cropped_xyz_dict_list: list[dict],
+        cropped_xyz_dict_list: np.ndarray,
         n_templates=1
     ) -> dict:
         """
@@ -954,11 +993,9 @@ class RNADataset(Dataset):
             Uses first MAX_TEMPLATE_FEATURES (4) templates, shuffled during training.
         """
 
-        ca_coordinates = []
-        for tmp_dict in cropped_xyz_dict_list:
-            ca_coordinates.append(tmp_dict["C1'"])
-        ca_coordinates = np.array(ca_coordinates)
-        ca_coordinates = torch.tensor(ca_coordinates)
+        ca_coordinates = torch.from_numpy(
+            cropped_xyz_dict_list[:, ATOM_NAME_TO_INDEX["C1'"]]
+        ).float()
 
         gt_xyz = ca_coordinates.clone()
         nan_mask = (gt_xyz <= -1e8).sum(1) > 0
@@ -1044,6 +1081,10 @@ class RNADataset(Dataset):
         # Generate molecular features from cropped data
         sample2feat = SampleDictToFeatures(cropped_single_sample_dict)
         features_dict, atom_array, token_array = sample2feat.get_feature_dict()
+        if sample_name in self.target_resolution:
+            features_dict["resolution"] = torch.tensor(
+                [self.target_resolution[sample_name]], dtype=torch.float32
+            )
 
         # Add specialized mask features for different model components
         features_dict["distogram_rep_atom_mask"] = torch.tensor(
@@ -1252,21 +1293,9 @@ class RNADataset(Dataset):
             f"{len(self.data_list)} total samples"
         )
     
-    def _create_masked_xyz(self, xyz_dict_list: list[dict]) -> list[dict]:
+    def _create_masked_xyz(self, xyz_dict_list: np.ndarray) -> np.ndarray:
         """Set all coordinates to INVALID_COORDINATE_VALUE for test set augmentation."""
-        masked_xyz_list = []
-        
-        for xyz_dict in xyz_dict_list:
-            masked_xyz = {}
-            for atom_name in xyz_dict.keys():
-                # Set all coordinates to invalid value
-                masked_xyz[atom_name] = np.array(
-                    [INVALID_COORDINATE_VALUE, INVALID_COORDINATE_VALUE, INVALID_COORDINATE_VALUE],
-                    dtype=np.float32
-                )
-            masked_xyz_list.append(masked_xyz)
-        
-        return masked_xyz_list
+        return np.full_like(xyz_dict_list, INVALID_COORDINATE_VALUE, dtype=np.float32)
 
     def __getitem__(self, idx: int) -> Union[dict, tuple[dict, AtomArray, dict]]:
         """

@@ -38,10 +38,18 @@ def to_device(obj, device):
         for k, v in obj.items():
             if isinstance(v, dict):
                 to_device(v, device)
+            elif isinstance(v, (list, tuple)):
+                obj[k] = type(v)(to_device(item, device) for item in v)
             elif isinstance(v, torch.Tensor):
                 obj[k] = obj[k].to(device)
+    elif isinstance(obj, list):
+        obj = [to_device(item, device) for item in obj]
+    elif isinstance(obj, tuple):
+        obj = tuple(to_device(item, device) for item in obj)
     elif isinstance(obj, torch.Tensor):
         obj = obj.to(device)
+    elif isinstance(obj, (str, bytes, int, float, bool, type(None))):
+        return obj
     else:
         raise Exception(f"type {type(obj)} not supported")
     return obj
@@ -199,8 +207,18 @@ def round_values(data, recursive=True):
 def autocasting_disable_decorator(disable_casting):
     def func_wrapper(func):
         def new_func(*args, **kwargs):
+            if torch.cuda.is_available():
+                amp_device_type = "cuda"
+            elif (
+                hasattr(torch.backends, "mps")
+                and torch.backends.mps.is_built()
+                and torch.backends.mps.is_available()
+            ):
+                amp_device_type = "mps"
+            else:
+                amp_device_type = "cpu"
             _amp_context = (
-                torch.autocast(device_type="cuda", enabled=False)
+                torch.autocast(device_type=amp_device_type, enabled=False)
                 if disable_casting
                 else nullcontext()
             )

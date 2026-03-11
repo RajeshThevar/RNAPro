@@ -69,8 +69,11 @@ from rnapro.data.utils import (
 
 logger = logging.getLogger(__name__)
 
-# Ignore inter residue metal coordinate bonds in mmcif _struct_conn
-pdbx_convert.PDBX_BOND_TYPE_ID_TO_TYPE.pop("metalc", None)
+# Ignore inter-residue metal coordinate bonds in mmCIF _struct_conn when the
+# installed Biotite exposes the bond-type lookup table. Older Biotite releases
+# used in local Python 3.9 environments do not define this symbol.
+if hasattr(pdbx_convert, "PDBX_BOND_TYPE_ID_TO_TYPE"):
+    pdbx_convert.PDBX_BOND_TYPE_ID_TO_TYPE.pop("metalc", None)
 
 
 class MMCIFParser:

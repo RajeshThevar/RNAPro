@@ -660,14 +660,16 @@ class RNAMSAFeaturizer(BaseMSAFeaturizer):
 class MSAFeaturizer:
     def __init__(
         self,
-        prot_msa_args: dict = {},
-        rna_msa_args: dict = {},
+        prot_msa_args: Optional[dict] = None,
+        rna_msa_args: Optional[dict] = None,
         enable_rna_msa: bool = False,
     ):
-        self.prot_msa_featurizer = PROTMSAFeaturizer(**prot_msa_args)
+        self.prot_msa_featurizer = (
+            PROTMSAFeaturizer(**prot_msa_args) if prot_msa_args else None
+        )
         self.enable_rna_msa = enable_rna_msa
         if self.enable_rna_msa:
-            self.rna_msa_featurizer = RNAMSAFeaturizer(**rna_msa_args)
+            self.rna_msa_featurizer = RNAMSAFeaturizer(**(rna_msa_args or {}))
 
     def __call__(
         self,
@@ -686,11 +688,14 @@ class MSAFeaturizer:
         Returns:
             Optional[dict[str, np.ndarray]]: A dictionary containing the merged MSA features for the bioassembly, or None if no features are generated.
         """
-        prot_msa_feats = self.prot_msa_featurizer.get_msa_features_for_assembly(
-            bioassembly_dict=bioassembly_dict,
-            entity_to_asym_id_int=entity_to_asym_id_int,
-            selected_token_indices=selected_indices,
-        )
+        if self.prot_msa_featurizer is not None:
+            prot_msa_feats = self.prot_msa_featurizer.get_msa_features_for_assembly(
+                bioassembly_dict=bioassembly_dict,
+                entity_to_asym_id_int=entity_to_asym_id_int,
+                selected_token_indices=selected_indices,
+            )
+        else:
+            prot_msa_feats = None
         if self.enable_rna_msa:
             rna_msa_feats = self.rna_msa_featurizer.get_msa_features_for_assembly(
                 bioassembly_dict=bioassembly_dict,

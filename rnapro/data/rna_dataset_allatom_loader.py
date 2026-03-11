@@ -42,6 +42,7 @@ logger = get_logger(__name__)
 def get_dataloaders(
     configs: ConfigDict, 
     seed=42, 
+    build_val: bool = True,
 ) -> tuple[DataLoader, dict[str, DataLoader]]:
     """
     Generate data loaders for training and testing based on the given configurations and seed.
@@ -86,17 +87,19 @@ def get_dataloaders(
     )
 
     
-    test_dataset = RNADataset(
-        data_dir=configs.data.train_sets[0],
-        use_msa=configs.use_msa,
-        crop_size = crop_size,
-        use_template=configs.use_template,
-        msa_dir=configs.msa_dir,
-        use_cluster=configs.use_cluster,
-        num_templates=configs.num_templates,
-        temporal_cutoff='2025-02-01',
-        mode='test',
-    )
+    test_dataset = None
+    if build_val:
+        test_dataset = RNADataset(
+            data_dir=configs.data.train_sets[0],
+            use_msa=configs.use_msa,
+            crop_size = crop_size,
+            use_template=configs.use_template,
+            msa_dir=configs.msa_dir,
+            use_cluster=configs.use_cluster,
+            num_templates=configs.num_templates,
+            temporal_cutoff='2025-02-01',
+            mode='test',
+        )
 
     if DIST_WRAPPER.world_size > 1:
         train_sampler = DistributedSampler(
@@ -132,22 +135,25 @@ def get_dataloaders(
             collate_fn=lambda batch: batch,
         )
 
-    test_sampler = DistributedSampler(
-        dataset=test_dataset,
-        num_replicas=DIST_WRAPPER.world_size,
-        rank=DIST_WRAPPER.rank,
-        #shuffle=False,
-        shuffle=False,
-    )
-    test_dls = DataLoader(
-        dataset=test_dataset,
-        batch_size=1,
-        sampler=test_sampler,
-        collate_fn=lambda batch: batch,
-        num_workers=0,
-    )
-    logger.info(
-        f"train data size: {len(train_dataset)}, test size: {len(test_dataset)}"
-    )
+    if test_dataset is not None:
+        test_sampler = DistributedSampler(
+            dataset=test_dataset,
+            num_replicas=DIST_WRAPPER.world_size,
+            rank=DIST_WRAPPER.rank,
+            shuffle=False,
+        )
+        test_dls = DataLoader(
+            dataset=test_dataset,
+            batch_size=1,
+            sampler=test_sampler,
+            collate_fn=lambda batch: batch,
+            num_workers=0,
+        )
+        logger.info(
+            f"train data size: {len(train_dataset)}, test size: {len(test_dataset)}"
+        )
+    else:
+        test_dls = None
+        logger.info(f"train data size: {len(train_dataset)}, validation skipped")
     
     return train_dl, test_dls

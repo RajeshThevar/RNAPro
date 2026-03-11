@@ -11,6 +11,7 @@ that AF3Trainer.init_data() can swap between loaders based on config.
 from __future__ import annotations
 
 import hashlib
+import os
 from typing import Optional
 
 import pandas as pd
@@ -270,6 +271,18 @@ def _build_msa_featurizer(configs: ConfigDict) -> Optional[object]:
     msa_dir = configs.get("msa_dir", "")
     if not msa_dir:
         return None
+    if os.path.isdir(msa_dir):
+        try:
+            dir_entries = os.listdir(msa_dir)
+        except OSError:
+            dir_entries = []
+        if any(name.endswith(".MSA.fasta") for name in dir_entries):
+            logger.warning(
+                "Multi-chain MSA expects AF3-style RNA MSA directories, but %s "
+                "contains RNA-only FASTA files; disabling multichain MSA for this run.",
+                msa_dir,
+            )
+            return None
 
     try:
         from rnapro.data.msa_featurizer import MSAFeaturizer, RNAMSAFeaturizer
@@ -283,13 +296,7 @@ def _build_msa_featurizer(configs: ConfigDict) -> Optional[object]:
         }
 
         return MSAFeaturizer(
-            prot_msa_args={
-                "msa_dir": "",
-                "indexing_method": "sequence",
-                "merge_method": "dense_max",
-                "max_size": 16384,
-                "dataset_name": "multichain_train",
-            },
+            prot_msa_args=None,
             rna_msa_args=rna_msa_args,
             enable_rna_msa=True,
         )
