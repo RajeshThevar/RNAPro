@@ -33,6 +33,7 @@ import logging
 import os
 import glob
 import re
+import traceback
 from argparse import Namespace
 from contextlib import nullcontext
 
@@ -631,48 +632,69 @@ class AF3Trainer(object):
             evaluated_pids = []
             total_batch_num = len(test_dl)
             for index, batch in enumerate(tqdm(test_dl)):
-                if isinstance(batch, list):
-                    print("len batch: ", len(batch))
-                    batch = batch[0]
+                pid = f"unknown_{index}"
+                try:
+                    if isinstance(batch, (list, tuple)):
+                        print("len batch: ", len(batch))
+                        batch = batch[0]
+                    # Test-mode datasets return (data_dict, AtomArray, entity_poly_type)
+                    if isinstance(batch, tuple):
+                        batch = batch[0]
 
-                batch = to_device(batch, self.device)
-                pid = batch["basic"]["pdb_id"]
+                    batch = to_device(batch, self.device)
+                    if "basic" in batch and "pdb_id" in batch["basic"]:
+                        pid = batch["basic"]["pdb_id"]
+                    elif "sample_name" in batch:
+                        pid = batch["sample_name"]
 
-                if index + 1 == total_batch_num and DIST_WRAPPER.world_size > 1:
-                    # Gather all pids across ranks for avoiding duplicated evaluations when drop_last = False
-                    all_data_ids = DIST_WRAPPER.all_gather_object(evaluated_pids)
-                    dedup_ids = set(sum(all_data_ids, []))
-                    if pid in dedup_ids:
-                        print(
-                            f"Rank {DIST_WRAPPER.rank}: Drop data_id {pid} as it is already evaluated."
+                    if index + 1 == total_batch_num and DIST_WRAPPER.world_size > 1:
+                        # Gather all pids across ranks for avoiding duplicated evaluations when drop_last = False
+                        all_data_ids = DIST_WRAPPER.all_gather_object(evaluated_pids)
+                        dedup_ids = set(sum(all_data_ids, []))
+                        if pid in dedup_ids:
+                            print(
+                                f"Rank {DIST_WRAPPER.rank}: Drop data_id {pid} as it is already evaluated."
+                            )
+                            break
+                    evaluated_pids.append(pid)
+
+                    simple_metrics = {}
+                    with enable_amp:
+                        # Model forward
+                        batch, _ = self.model_forward(batch, mode=mode)
+                        # Loss forward
+                        loss, loss_dict, batch = self.get_loss(batch, mode="eval")
+                        # lDDT metrics
+                        lddt_dict = self.get_metrics(batch)
+                        lddt_metrics = self.aggregate_metrics(lddt_dict, batch)
+                        simple_metrics.update(
+                            {k: v for k, v in lddt_metrics.items() if "diff" not in k}
                         )
-                        break
-                evaluated_pids.append(pid)
+                        simple_metrics.update(loss_dict)
 
-                simple_metrics = {}
-                with enable_amp:
-                    # Model forward
-                    batch, _ = self.model_forward(batch, mode=mode)
-                    # Loss forward
-                    loss, loss_dict, batch = self.get_loss(batch, mode="eval")
-                    # lDDT metrics
-                    lddt_dict = self.get_metrics(batch)
-                    lddt_metrics = self.aggregate_metrics(lddt_dict, batch)
-                    simple_metrics.update(
-                        {k: v for k, v in lddt_metrics.items() if "diff" not in k}
+                    # Metrics
+                    for key, value in simple_metrics.items():
+                        simple_metric_wrapper.add(
+                            f"{ema_suffix}{key}", value, namespace=test_name
+                        )
+
+                    del batch, simple_metrics
+                    if index % 5 == 0:
+                        # Release some memory periodically
+                        self.empty_cache()
+                except Exception as e:
+                    err_msg = (
+                        f"Evaluation failed on split={test_name}, index={index}, "
+                        f"pid={pid}, ema_suffix={ema_suffix}: {e}\n"
+                        f"{traceback.format_exc()}"
                     )
-                    simple_metrics.update(loss_dict)
-
-                # Metrics
-                for key, value in simple_metrics.items():
-                    simple_metric_wrapper.add(
-                        f"{ema_suffix}{key}", value, namespace=test_name
-                    )
-
-                del batch, simple_metrics
-                if index % 5 == 0:
-                    # Release some memory periodically
-                    self.empty_cache()
+                    self.print(err_msg)
+                    if DIST_WRAPPER.rank == 0:
+                        err_name = f"eval_{test_name}_{ema_suffix or 'base'}_{pid}.log"
+                        err_path = os.path.join(self.error_dir, err_name)
+                        with open(err_path, "w", encoding="utf-8") as f:
+                            f.write(err_msg)
+                    raise
 
             metrics = simple_metric_wrapper.calc()
             self.print(f"Step {self.step}, eval {test_name}: {metrics}")
@@ -794,7 +816,7 @@ class AF3Trainer(object):
                 step_need_eval &= is_update_step
                 step_need_save &= is_update_step
 
-                if isinstance(batch, list):
+                if isinstance(batch, (list, tuple)):
                     print("len batch: ", len(batch))
                     batch = batch[0]
 
